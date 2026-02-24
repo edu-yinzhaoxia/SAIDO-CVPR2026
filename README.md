@@ -2,7 +2,6 @@
 
 [Paper](https://arxiv.org/abs/2512.00539)
 
-![Pipeline](pipeline.png)
 
 CVPR 2026
 
