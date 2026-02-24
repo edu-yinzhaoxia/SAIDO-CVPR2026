@@ -1,0 +1,32 @@
+base:
+  train_txt : './dataset/captions/train.txt'
+  val_txt : './dataset/captions/val.txt'
+  test_txt : 'dataset/captions/test.txt'
+
+training:
+  method : 'SAIDO'
+  split : 'open_world_image_clip_nonpretrained'
+  restart : '0'
+  timestamp : 9
+  num_classes : 2
+  load_prev: False # whether load previous unfinished timestamp training
+  eval: False
+
+feature_train:
+  pretrain_feature : 'None'
+  pretrain_feature_shape: 768
+
+parameter:
+  nepoch : 1
+  batch_size : 1
+  step_schedular_decay : 20
+  schedular_step : 0.5
+  start_lr : 0.01
+  weight_decay : 1e-5
+  momentum : 0.9
+  random_seed : 1111
+  test_split : 0.3
+  max_memory_size : 30000000
+  seed : 1007
+
+
