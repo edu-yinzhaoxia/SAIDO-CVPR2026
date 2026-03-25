@@ -18,7 +18,7 @@ from avalanche.training.plugins.evaluation import default_logger
 from avalanche.training.plugins import StrategyPlugin, CWRStarPlugin, \
     ReplayPlugin, GDumbPlugin, LwFPlugin, AGEMPlugin, GEMPlugin, EWCPlugin, \
     EvaluationPlugin, SynapticIntelligencePlugin, CoPEPlugin, \
-    GSS_greedyPlugin, LFLPlugin, OWMPlugin, RAWMPlugin, RWMPlugin, RegOPlugin, LoRAPlugin
+    GSS_greedyPlugin, LFLPlugin, OWMPlugin, RAWMPlugin, RWMPlugin, RegOPlugin, SAIDOPlugin
 from avalanche.training.strategies.base_strategy import BaseStrategy
 
 
@@ -913,5 +913,5 @@ __all__ = [
     'RAWM',
     'RWM',
     'RegO',
-    'LoRA'
+    'SAIDO'
 ]
