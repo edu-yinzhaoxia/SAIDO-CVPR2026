@@ -8,10 +8,12 @@
 # E-mail: contact@continualai.org                                              #
 # Website: avalanche.continualai.org                                           #
 ################################################################################
+import copy
 import logging
 import warnings
-
+from tqdm import tqdm
 import torch
+from avalanche.evaluation.metric_results import MetricValue
 from torch.utils.data import DataLoader
 from typing import Optional, Sequence, Union, List
 
@@ -295,22 +297,19 @@ class BaseStrategy:
         if not isinstance(experiences, Sequence):
             experiences = [experiences]
         if eval_streams is None:
-            #print('---------------------ok----------------------')
             eval_streams = [experiences]
 
-        # Save validation stream (optional), for validation set evaluation after each epoch
         self._val_streams_global = val_streams
         self._before_training(**kwargs)
         self._periodic_eval(eval_streams, do_final=False, do_initial=True)
 
         for self.experience_id, self.experience in enumerate(experiences):
-            # Select corresponding validation stream for current experience (assume val_streams organized by experience)
             current_val_stream = None
             if self._val_streams_global is not None:
                 if isinstance(self._val_streams_global, Sequence) and len(self._val_streams_global) > self.experience_id:
                     current_val_stream = self._val_streams_global[self.experience_id]
                 elif not isinstance(self._val_streams_global, Sequence):
-                    # If val_streams is not a sequence, use directly
+                    
                     current_val_stream = self._val_streams_global
             self.train_exp(self.experience, val_streams=current_val_stream, **kwargs)
         self._after_training(**kwargs)
@@ -338,15 +337,17 @@ class BaseStrategy:
         if val_streams is None:
             val_streams = getattr(self, "_val_streams_global", None)
 
-        self._best_val_acc_epoch = 0
+        self.best_val_acc = -1
         self._best_state_epoch = None
         self._best_epoch_idx = -1
+        self.best_model_state = None
 
         self._before_train_dataset_adaptation(**kwargs)
         self.train_dataset_adaptation(**kwargs)
         self._after_train_dataset_adaptation(**kwargs)
         self.make_train_dataloader(**kwargs)
 
+        # Model Adaptation (e.g. freeze/add new units)
         self.model = self.model_adaptation()
         self.make_optimizer()
 
@@ -355,80 +356,99 @@ class BaseStrategy:
         for _ in range(self.train_epochs):
             self._before_training_epoch(**kwargs)
 
-            if self._stop_training:
+            if self._stop_training:  # Early stopping
                 self._stop_training = False
                 break
 
             self.training_epoch(**kwargs)
-            import pdb
-            pdb.set_trace()
-            self._after_training_epoch(**kwargs)
-            import pdb
-            pdb.set_trace()
-
             if val_streams is not None:
-                print(f"[VAL] Epoch { _ + 1}/{self.train_epochs}")
-                try:
-                    avg_acc = self._validate_on_streams(val_streams)
-                    if avg_acc is not None:
-                        print(f"[VAL] avg_acc={avg_acc:.4f}, best={self._best_val_acc_epoch:.4f}")
-                        if avg_acc > self._best_val_acc_epoch:
-                            self._best_val_acc_epoch = avg_acc
-                            self._best_epoch_idx = _
-                            # Save current model weights
-                            root = self.model.module if hasattr(self.model, 'module') else self.model
-                            self._best_state_epoch = {k: v.detach().cpu().clone() for k, v in root.state_dict().items()}
-                except Exception as e:
-                    print(f"[VAL ERROR] {e}")
-                    pass
+                #print(f"[VAL] Epoch {_ + 1}/{self.train_epochs}")
 
-        if self._best_state_epoch is not None:
-            try:
-                root = self.model.module if hasattr(self.model, 'module') else self.model
-                root.load_state_dict(self._best_state_epoch)
-            except Exception:
-                pass
+                val_acc = self._validate_on_streams(val_streams)
+                self._last_val_acc = val_acc
+                if val_acc is not None:
+                    metric_name = "Val/avg_accuracy"  
+                    current_epoch = self.clock.train_exp_epochs  
+                    exp_id = self.experience.current_experience  
+                    val_acc_metric = MetricValue(
+                        name=f"Val/Exp_{exp_id}/avg_accuracy",  
+                        value=val_acc,  
+                        x_plot=current_epoch,  
+                        origin=self  
+                    )
+
+                    best_val_acc_metric = MetricValue(
+                        name=f"Val/Exp_{exp_id}/best_avg_accuracy",
+                        value=self.best_val_acc,
+                        x_plot=current_epoch,
+                        origin=self  
+                    )
+                    metric_values = [val_acc_metric, best_val_acc_metric]
+                    for mv in metric_values:
+                        name = mv.name
+                        x = mv.x_plot
+                        val = mv.value
+                        if self.evaluator.collect_all:
+                            self.evaluator.all_metric_results[name][0].append(x)
+                            self.evaluator.all_metric_results[name][1].append(val)
+                        self.evaluator.last_metric_results[name] = val
+                    for logger in self.evaluator.loggers:
+                        for mv in metric_values:
+                            logger.log_single_metric(mv.name, mv.value, mv.x_plot)
+
+                    print(f"[VAL] Epoch {_ + 1}/{self.train_epochs} | "
+                          f"new_avg_acc={val_acc:.4f}, last_best={self.best_val_acc:.4f}")
+                    if val_acc > self.best_val_acc:
+                        self.best_val_acc = val_acc
+                        self._best_epoch_idx = _
+                        self.best_model_state = copy.deepcopy(self.model.state_dict())
+            self._after_training_epoch(**kwargs)
+        if self.best_model_state is not None:
+            self.model.load_state_dict(self.best_model_state)
+            print(f"Loaded best model (val acc = {self.best_val_acc:.2f}%),best_epoch={self._best_epoch_idx}")
+
         self._after_training_exp(**kwargs)
 
-    def _validate_on_streams(self, val_streams):
-        """Evaluate on given validation stream, return average Top1 accuracy (if available)."""
-        prev_training = self.is_training
-        self.is_training = False
-        self.model.eval()
+    def _compute_accuracy(self, model, loader, desc="Val"):
+        model.eval()
+        correct, total = 0, 0
+        device = self.device
+        with torch.no_grad():
+            for imgs, targets, task_labels, scene_ids, batch_prompts in tqdm(
+                    loader, desc=desc, leave=False
+            ):
+                imgs, targets = imgs.to(device), targets.to(device)
+                batch_prompts = {k: v.to(device) for k, v in batch_prompts.items()}
+                outputs, _, _ = model(imgs, task_labels, scene_ids, batch_prompts)
+                predicts = torch.max(outputs, dim=1)[1]
+                correct += (predicts == targets).sum().item()
+                total += targets.size(0)
 
-        streams = val_streams
-        if streams is None:
+        acc = 100.0 * correct / total if total > 0 else 0.0
+        return round(acc, 2)
+
+    def _validate_on_streams(self, val_streams):
+        if val_streams is None:
             return None
-        if not isinstance(streams, Sequence):
-            streams = [streams]
-        for i, exp in enumerate(streams):
+        if not isinstance(val_streams, Sequence):
+            val_streams = [val_streams]
+        for i, exp in enumerate(val_streams):
             if not isinstance(exp, Sequence):
-                streams[i] = [exp]
+                val_streams[i] = [exp]
 
         acc_list = []
-        for exp_group in streams:
+        for exp_group in val_streams:
             for exp in exp_group:
-                try:
-                    res = self.eval(exp)
-                    key_candidates = [k for k in res.keys() if 'Top1_Acc' in k and 'eval_phase' in k]
-                    val = None
-                    for k in key_candidates:
-                        v = res.get(k, None)
-                        try:
-                            v = float(v.cpu().item()) if isinstance(v, torch.Tensor) else float(v)
-                        except Exception:
-                            v = None
-                        if v is not None:
-                            val = v
-                            break
-                    if val is not None:
-                        acc_list.append(val)
-                except Exception:
-                    pass
-
-        self.is_training = prev_training
-        if prev_training:
-            self.model.train()
+                loader = SceneGroupedTaskBalancedDataLoader(
+                    avalanche_dataset=exp.dataset,
+                    batch_size=self.train_mb_size,
+                    shuffle=True,
+                    num_workers=0,
+                    pin_memory=True,
+                    oversample_small_tasks=True
+                )
+                acc = self._compute_accuracy(self.model, loader, desc=f"Val exp-{exp.current_experience}")
+                acc_list.append(acc)
 
         if len(acc_list) == 0:
             return None
@@ -540,12 +560,12 @@ class BaseStrategy:
             pinned memory before returning them. Defaults to True.
         """
         self.dataloader = SceneGroupedTaskBalancedDataLoader(
-            avalanche_dataset=self.adapted_dataset,  # Changed here
+            avalanche_dataset=self.adapted_dataset, 
             batch_size=self.train_mb_size,
             shuffle=shuffle,
             num_workers=num_workers,
             pin_memory=pin_memory,
-            oversample_small_tasks=True  # Can be set according to needs
+            oversample_small_tasks=True  
         )
         '''
         for i, batch in enumerate(self.dataloader):
@@ -567,12 +587,12 @@ class BaseStrategy:
         :return:
         """
         self.dataloader = SceneGroupedTaskBalancedDataLoader(
-            avalanche_dataset=self.adapted_dataset,  # Changed here
+            avalanche_dataset=self.adapted_dataset,  
             batch_size=self.train_mb_size,
             shuffle=True,
             num_workers=num_workers,
             pin_memory=pin_memory,
-            oversample_small_tasks=True  # Can be set according to needs
+            oversample_small_tasks=True  
         )
 
     def _after_train_dataset_adaptation(self, **kwargs):
@@ -600,7 +620,7 @@ class BaseStrategy:
         :param kwargs:
         :return:
         """
-
+        self.model.train()
         for self.i_batch, self.mbatch in enumerate(self.dataloader):
             if self._stop_training:
                 break
@@ -615,8 +635,6 @@ class BaseStrategy:
             self.output=self.forward()
             self.mb_output = self.output[0]
             self._after_forward(**kwargs)
-
-            # Loss & Backward
             self.loss += self.criterion()
 
             self._before_backward(**kwargs)
@@ -627,7 +645,6 @@ class BaseStrategy:
             self._before_update(**kwargs)
             self.optimizer.step()
             self._after_update(**kwargs)
-
             self._after_training_iteration(**kwargs)
 
     def _unpack_minibatch(self):
@@ -681,9 +698,9 @@ class BaseStrategy:
             p.after_update(self, **kwargs)
 
     def _after_training_epoch(self, **kwargs):
-        print(self.plugins)
+        #print(self.plugins)
         for p in self.plugins:
-            print('plugin:',p)
+            #print('plugin:',p)
             p.after_training_epoch(self, **kwargs)
 
     def _after_training_exp(self, **kwargs):
