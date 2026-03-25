@@ -29,6 +29,7 @@ def up_down_sample_pil(img_pil: Image.Image) -> Image.Image:
     """Downsample by 2 (nearest) then upsample back to original size (nearest)."""
     w, h = img_pil.size
     w2, h2 = max(1, w // 2), max(1, h // 2)
+    # nearest neighbor down and up
     small = img_pil.resize((w2, h2), resample=Image.NEAREST)
     up = small.resize((w, h), resample=Image.NEAREST)
     return up
@@ -63,11 +64,7 @@ class RobustMixAugment:
         return img
 
 class LoRADataset(Dataset):
-    """
-    Load data from .txt file:
-    Each line format: path, caption, scene_id, pred_scene_id, model_label, realfake_label
-    Returns: (img, label, model_label, scene_id, prompt)
-    """
+    
     def __init__(self, data_txt_path, stage='train', transform=None, robust_type=None):
         self.samples = []
         self.model_targets = []
@@ -77,22 +74,18 @@ class LoRADataset(Dataset):
         self.stage = stage
         self.transform = transform
         self.robust_type = robust_type
-        #self.robust_mode = robust_mode
 
         with open(data_txt_path, "r", encoding="utf-8") as f:
             f.readline()  
             for line in f:
-                path, caption,scene_id,_ , model_label, realfake_label = line.strip().split("\t")
-                path = path.replace("\\", "/")
-                path = os.path.normpath(path)
-                
-                path = path.replace("\\", "/")
+                path, caption, scene_id,_ , model_label, realfake_label = line.strip().split("\t")
                 self.samples.append(path)
                 self.model_targets.append(int(model_label))
                 self.realfake_targets.append(int(realfake_label))
                 self.scene_ids.append(int(scene_id))
 
                 content_prompt = caption.strip()
+
                 scene_prompts_map = {
                     0: "an activity or action",
                     1: "a type of animal",
@@ -106,6 +99,7 @@ class LoRADataset(Dataset):
                     9: "a type of vehicle",
                 }
                 scene_prompt = scene_prompts_map.get(int(scene_id), f"{scene_id}")
+
                 real_fake_prompt = "Camera" if int(realfake_label) == 0 else "Deepfake"
 
                 full_prompt = f"{real_fake_prompt},{scene_prompt},{content_prompt}"
@@ -123,16 +117,6 @@ class LoRADataset(Dataset):
     def __getitem__(self, index):
         try:
             img_path = self.samples[index]
-            if not isinstance(img_path, str):
-                raise ValueError(f"Invalid path type: {type(img_path)}")
-            
-            img_path = img_path.replace("\\", "/")
-            img_path = os.path.normpath(img_path)
-            img_path = img_path.replace("\\", "/")
-            
-            if not os.path.exists(img_path):
-                raise FileNotFoundError(f"Image file not found: {img_path}")
-            
             img = Image.open(img_path).convert("RGB")
             
             if self.stage == "test" and self.robust_type is not None:
@@ -152,13 +136,17 @@ class LoRADataset(Dataset):
             return img, label, model_label, scene_id, prompt
         except Exception as e:
             print(f"[ERROR] Failed to open image at index={index}, path={self.samples[index]}, error={e}")
-            raise RuntimeError(f"Failed to load image at index {index}: {e}") from e
+            return None
+
+        label = self.realfake_targets[index]  
+        model_label = self.model_targets[index]  
+        scene_id = self.scene_ids[index]       
+        prompt = self.prompts[index]           
+
+        return img, label, model_label, scene_id, prompt
 
 class LoRASubset(Dataset):
-    """
-    Subset for a specific generative model type (model_label),
-    returns (img, label, task_label, scene_id, prompt).
-    """
+    
     def __init__(self, dataset, indices, model_label):
         self.dataset = Subset(dataset, indices)
         self.indices = indices
@@ -170,7 +158,7 @@ class LoRASubset(Dataset):
         self.prompts = [dataset.prompts[i] for i in indices]
         self.targets = self.realfake_targets
 
-        print(f"[LoRASubset] Construction complete: model={model_label}, subset size={len(self.indices)}")
+        print(f"[LoRASubset] construction complete: model={model_label}, subset size={len(self.indices)}")
 
     def __len__(self):
         return len(self.indices)
@@ -201,10 +189,10 @@ def get_transforms():
     ])
     '''
     train_transform = transforms.Compose([
-        RobustMixAugment(p_jpeg=0.5, p_noise=0.5, jpeg_quality=50, noise_std=0.0157),
+        # RobustMixAugment(p_jpeg=0.5, p_noise=0.5, jpeg_quality=40, noise_std=0.03),
         transforms.Resize((224, 224)),
         transforms.RandomCrop(224),
-        transforms.RandomHorizontalFlip(),
+        #transforms.RandomHorizontalFlip(),
         transforms.ToTensor(),
         normalize,
     ])
@@ -226,10 +214,13 @@ def get_lora_scene_scenario(args):
     train_tf, val_tf, test_tf = get_transforms()
     train_ds = LoRADataset(args.train_txt, stage="train", transform=train_tf)
     val_ds = LoRADataset(args.val_txt, stage="val", transform=val_tf)
+    #test_ds = LoRADataset(args.test_txt, stage="test", transform=test_tf)
     test_ds_clean = LoRADataset(args.test_txt, stage="test", transform=test_tf)
+    '''
     robust_jpeg_ds = LoRADataset(args.test_txt, stage="test", transform=test_tf, robust_type="jpeg")
     robust_gauss_ds = LoRADataset(args.test_txt, stage="test", transform=test_tf, robust_type="gaussian")
     robust_down_ds = LoRADataset(args.test_txt, stage="test", transform=test_tf, robust_type="downsample")
+    '''
     n_models = args.timestamp
 
     list_train, list_val, list_test = [], [], []
@@ -241,6 +232,7 @@ def get_lora_scene_scenario(args):
     for m in range(n_models):
         train_idx = torch.where(torch.tensor(train_ds.model_targets) == m)[0]
         test_idx = torch.where(torch.tensor(test_ds_clean.model_targets) == m)[0]
+        
         val_indices = []
         for task in range(m + 1):  
             task_indices = torch.where(torch.tensor(val_ds.model_targets) == task)[0]
@@ -248,18 +240,21 @@ def get_lora_scene_scenario(args):
         if len(train_idx) > 0:
             train_sub = LoRASubset(train_ds, train_idx, m)
             sample = train_sub[0]
-            print("Sample structure train_sub:", sample)
-            print("Sample length:", len(sample))
+            print("train_sub:", sample)
+            print("length:", len(sample))
+            
             train_set = AvalancheDataset(train_sub, task_labels=m)
             sample = train_sub[0]
-            print("Sample structure train_set:", sample)
-            print("Sample length:", len(sample))
+            print("train_set:", sample)
+            print("length:", len(sample))
             list_train.append(train_set)
 
         if len(test_idx) > 0:
             test_sub = LoRASubset(test_ds_clean, test_idx, m)
             test_set = AvalancheDataset(test_sub, task_labels=m)
             list_test.append(test_set)
+            '''
+            
             jpeg_sub = LoRASubset(robust_jpeg_ds, test_idx, m)
             gauss_sub = LoRASubset(robust_gauss_ds, test_idx, m)
             down_sub = LoRASubset(robust_down_ds, test_idx, m)
@@ -267,7 +262,7 @@ def get_lora_scene_scenario(args):
             jpeg_streams.append(AvalancheDataset(jpeg_sub, task_labels=m))
             gaussian_streams.append(AvalancheDataset(gauss_sub, task_labels=m))
             downsample_streams.append(AvalancheDataset(down_sub, task_labels=m))
-
+            '''
         if val_indices:  
             val_idx = torch.cat(val_indices, dim=0)
             if len(val_idx) > 0:
@@ -282,7 +277,7 @@ def get_lora_scene_scenario(args):
         train_transform=train_tf,
         eval_transform=test_tf,
     )
-
+    '''
     jpeg_scenario = dataset_benchmark(
         train_datasets=list_train,
         test_datasets=jpeg_streams,
@@ -304,7 +299,7 @@ def get_lora_scene_scenario(args):
         test_datasets=downsample_streams,
         eval_transform=test_tf
     )
-
-
+    
     return scenario, jpeg_scenario, gaussian_scenario, downsample_scenario
-
+    '''
+    return scenario
