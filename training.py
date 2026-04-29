@@ -83,8 +83,8 @@ def get_all_scene_ids(txt_path: str):
             parts = line.strip().split("\t")
             if len(parts) < 3:
                 continue
-            scene_id = parts[2]  # Third field
-            scene_ids.add(str(scene_id))  # Ensure converted to string
+            scene_id = parts[2]  
+            scene_ids.add(str(scene_id))  
     return sorted(scene_ids)
 
 global args
@@ -110,17 +110,10 @@ os.makedirs("./{}/metric/".format(args.split), exist_ok=True)
 method_query = args.method.split()  # list of CL method to run
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-# torch.cuda.get_device_name(0)
-# torch.cuda.device_count()
 print(device)
-
-'''
-Remember to delete the old feature path before generating new feature 
-'''
 
 for strate in method_query:
     for current_mode in ['offline']:
-        # skip previous train model if necessary
         import glob
 
         model_path = sorted(glob.glob('../{}/model/model_{}_{}*'.format(args.split, strate, current_mode)))
@@ -193,8 +186,19 @@ for strate in method_query:
             print()
         if (torch.cuda.is_available()):
             model = model.cuda()
-        optimizer = SGD(list(filter(lambda x: x.requires_grad, model.parameters())), lr=args.start_lr,
-                        weight_decay=float(args.weight_decay), momentum=args.momentum)
+            
+        trainable_params = [
+            p for n, p in model.named_parameters()
+            if ("lora_" in n or p.requires_grad)
+        ]
+
+        optimizer = torch.optim.SGD(
+            trainable_params,
+            lr=args.start_lr,
+            weight_decay=float(args.weight_decay),
+            momentum=args.momentum
+        )
+
         scheduler = make_scheduler(optimizer, args.step_schedular_decay, args.schedular_step)
 
         plugin_list = [LRSchedulerPlugin(scheduler), LoadBestPlugin('train_stream')]
